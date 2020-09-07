@@ -1,0 +1,778 @@
+#include <Arduino.h>
+#include<WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncJson.h>
+#include <ArduinoJson.h>
+#include <esp_task_wdt.h>
+
+const char* ssid = "Eduardo-2.4";
+const char* password = "@Edu143804-24";
+
+WiFiServer server(80);
+AsyncWebServer server2(80);
+// Set your Static IP address
+IPAddress local_IP(192, 168, 15, 20);
+// Set your Gateway IP address
+IPAddress gateway(192, 168, 15, 11);
+
+IPAddress subnet(255, 255, 0, 0);
+IPAddress primaryDNS(8, 8, 8, 8); // optional
+IPAddress secondaryDNS(8, 8, 4, 4); // optional
+String header;
+
+#define PINO_DIM    26
+#define PINO_ZC     15
+#define maxBrightness 1000
+#define minBrightness 7500
+volatile int luminosidade = 0;
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+volatile int counter = 0;
+volatile int total = 0;
+
+void IRAM_ATTR zeroCross()  {
+  
+  if(luminosidade == 0) return;
+  
+  portENTER_CRITICAL_ISR(&mux);
+    counter++;
+    if(counter == 2){
+      counter = 0;
+        delayMicroseconds(luminosidade);   
+        digitalWrite(PINO_DIM, HIGH);  
+        delayMicroseconds(30);      
+        digitalWrite(PINO_DIM, LOW);
+    }  
+  portEXIT_CRITICAL_ISR(&mux);
+}
+
+void start(){
+  pinMode(PINO_ZC, INPUT_PULLUP);
+  pinMode(PINO_DIM, OUTPUT);
+  digitalWrite(PINO_DIM, LOW);
+  attachInterrupt(digitalPinToInterrupt(PINO_ZC), zeroCross, RISING);
+}
+
+void turnLightOn(){
+  luminosidade = maxBrightness;
+  digitalWrite(PINO_DIM, HIGH);
+  
+}
+
+void turnLightOff(){
+  luminosidade = 0;
+  digitalWrite(PINO_DIM, LOW);
+}
+
+void setPowerEndpoint(){
+  server2.on("/power", HTTP_POST, [](AsyncWebServerRequest *request){},
+  [](AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final){},
+      [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+      {
+          StaticJsonDocument<200> jsonBuffer;
+          DeserializationError error = deserializeJson(jsonBuffer, data);
+          if (error) {
+            Serial.printf("Error ao deserializar");
+            Serial.println(error.c_str());
+            return;
+          }
+          const byte power = jsonBuffer["power"];
+          if(power == 1){
+            turnLightOn();
+          }else{
+            turnLightOff();
+          }
+          delay(10);
+          request->send(200, "text/plain", "{\"response\": \"eu\"}");
+          
+      });
+}
+
+void setBrightness(){
+  server2.on("/brightness", HTTP_POST, [](AsyncWebServerRequest *request){},
+  [](AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final){},
+      [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+      {
+          StaticJsonDocument<200> jsonBuffer;
+          DeserializationError error = deserializeJson(jsonBuffer, data);
+          if (error) {
+            Serial.printf("Error ao deserializar");
+            Serial.println(error.c_str());
+            return;
+          }
+          const int brightness = jsonBuffer["brightness"];
+          Serial.printf("param ");
+          luminosidade = map(brightness, 95, 5, maxBrightness, minBrightness);
+          Serial.println(luminosidade);
+          delay(10);
+          request->send(200, "text/plain", "{\"response\": \"eu\"}");
+          
+      });
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  start();
+  luminosidade = 0;
+  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
+    Serial.println("STA Failed to configure");
+  }
+  Serial.print("Conectando a");
+  Serial.println(ssid);
+  WiFi.begin(ssid,password);
+  while(WiFi.status() != WL_CONNECTED){
+    delay(500);
+    Serial.print("."); 
+  }
+  Serial.println("Conectado");
+  server2.begin();
+  setBrightness();
+  setPowerEndpoint();
+}
+
+
+void loop() {
+  //TODO testar delay de 1 minuto e ver se a lampada continua funcionando
+  }
+
+  ////////////////////////////////////////////
+
+  #include <Arduino.h>
+#include<WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncJson.h>
+#include <ArduinoJson.h>
+#include <DS3231.h> 
+#include <Wire.h>
+
+const char* ssid = "Eduardo-2.4";
+const char* password = "@Edu143804-24";
+
+WiFiServer server(80);
+AsyncWebServer server2(80);
+// Set your Static IP address
+IPAddress local_IP(192, 168, 15, 20);
+IPAddress gateway(192, 168, 15, 11);
+IPAddress subnet(255, 255, 0, 0);
+IPAddress primaryDNS(8, 8, 8, 8); // optional
+IPAddress secondaryDNS(8, 8, 4, 4); // optional
+
+
+String header;
+
+#define PINO_DIM    26
+#define PINO_ZC     15
+#define maxBrightness 1000
+#define minBrightness 7500
+#define INTERVAL_TRIGGER_TRIAC 10
+#define IDLE -1
+
+
+hw_timer_t * timerToPinHigh = NULL;
+hw_timer_t * timerToPinLow  = NULL;
+
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+volatile bool isPinHighEnabled = false;
+volatile bool shouldPinHighTriggerAlarm = false;
+volatile bool shouldPinLowTriggerAlarm = false;
+volatile long currentBrightness = minBrightness; 
+
+SemaphoreHandle_t semaphonePinHigh = xSemaphoreCreateBinary();
+SemaphoreHandle_t semaphonePinLow  = xSemaphoreCreateBinary();
+
+DS3231 rtc;
+RTCDateTime dt;
+boolean isAlarm = false;
+boolean alarmState = false;
+
+
+//TODO verificar necessidade real desse método
+//TODO usar semaforos e deixar as ISR apenas setando uma flag
+// void stopPinHighTimer(hw_timer_t *timer){
+//   timerAlarmDisable(timer);    
+//   timerDetachInterrupt(timer); 
+//   timerEnd(timer);
+//   timer = NULL;
+//   isPinHighEnabled = false;
+// }
+
+void IRAM_ATTR ISR_turnPinLow(){
+  portENTER_CRITICAL_ISR(&mux); 
+    digitalWrite(PINO_DIM, LOW);
+    isPinHighEnabled = false;
+    //stopPinHighTimer(timerToPinHigh);
+  portEXIT_CRITICAL_ISR(&mux); 
+}
+
+void setTimer(hw_timer_t * timer, long interruptAt, void (*callback)()){
+  timer = timerBegin(1, 80, true);
+  timerAttachInterrupt(timer, callback, true);
+  timerAlarmWrite(timer, interruptAt, false);
+  timerAlarmEnable(timer);
+}
+
+
+void IRAM_ATTR ISR_turnPinHigh(){
+  portENTER_CRITICAL_ISR(&mux); 
+    digitalWrite(PINO_DIM, HIGH);  
+    setTimer(timerToPinLow, INTERVAL_TRIGGER_TRIAC, &ISR_turnPinHigh); 
+  portEXIT_CRITICAL_ISR(&mux); 
+}
+
+void setTimerPinHigh(long interruptAt){
+  timerToPinHigh = timerBegin(1, 80, true);
+  timerAttachInterrupt(timerToPinHigh, &ISR_turnPinHigh, true);
+  timerAlarmWrite(timerToPinHigh, interruptAt, false);
+  timerAlarmEnable(timerToPinHigh);
+}
+
+void IRAM_ATTR ISR_zeroCross()  {
+  if(currentBrightness == IDLE) return;
+  portENTER_CRITICAL_ISR(&mux); 
+    if(!isPinHighEnabled){
+       isPinHighEnabled = true; 
+       setTimer(timerToPinHigh, currentBrightness, &ISR_zeroCross);
+    }
+  portEXIT_CRITICAL_ISR(&mux); 
+}
+
+void start(){
+  pinMode(PINO_ZC,   INPUT_PULLUP);
+  pinMode(PINO_DIM, OUTPUT);
+  digitalWrite(PINO_DIM, LOW);
+  attachInterrupt(digitalPinToInterrupt(PINO_ZC), ISR_zeroCross, RISING);
+}
+
+void turnLightOn(){
+  portENTER_CRITICAL(&mux);
+    currentBrightness = maxBrightness;
+    digitalWrite(PINO_DIM, HIGH);
+  portEXIT_CRITICAL(&mux);
+}
+
+void turnLightOff(){
+  portENTER_CRITICAL(&mux);
+    currentBrightness = IDLE;
+    digitalWrite(PINO_DIM, LOW);
+  portEXIT_CRITICAL(&mux);
+}
+
+
+void setPowerEndpoint(){
+  server2.on("/power", HTTP_POST, [](AsyncWebServerRequest *request){},
+  [](AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final){},
+      [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+      {
+          StaticJsonDocument<200> jsonBuffer;
+          DeserializationError error = deserializeJson(jsonBuffer, data);
+          if (error) {
+            Serial.printf("Error ao deserializar");
+            Serial.println(error.c_str());
+            return;
+          }
+          const byte power = jsonBuffer["power"];
+          if(power == 1){
+            turnLightOn();
+            delay(10);
+            request->send(200, "text/plain", "{\"response\": \"eu\"}");
+          }else{
+            turnLightOff();
+            delay(10);
+            request->send(201, "text/plain", "{\"response\": \"eu\"}");
+          }
+      });
+}
+
+void setBrightness(){
+  server2.on("/brightness", HTTP_POST, [](AsyncWebServerRequest *request){},
+  [](AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final){},
+      [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+      {
+          StaticJsonDocument<200> jsonBuffer;
+          DeserializationError error = deserializeJson(jsonBuffer, data);
+          if (error) {
+            Serial.printf("Error ao deserializar");
+            Serial.println(error.c_str());
+            return;
+          }
+          int brightness = jsonBuffer["brightness"];
+          brightness = map(brightness, 100, 0, maxBrightness, minBrightness);
+          portENTER_CRITICAL(&mux);
+            currentBrightness = brightness;
+          portEXIT_CRITICAL(&mux);
+          delay(10);
+          request->send(200, "text/plain", "{\"response\": \"eu\"}");
+          
+      });
+}
+
+void setup() {
+  Serial.begin(115200);
+  rtc.begin();
+  rtc.armAlarm1(false);
+  rtc.armAlarm2(false);
+  rtc.clearAlarm1();
+  rtc.clearAlarm2();
+  rtc.setAlarm1(0, 0, 0, 0, DS3231_EVERY_SECOND);
+  
+  start();
+  currentBrightness = IDLE;
+  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
+    Serial.println("STA Failed to configure");
+  }
+  Serial.print("Conectando a");
+  Serial.println(ssid);
+  WiFi.begin(ssid,password);
+  while(WiFi.status() != WL_CONNECTED){
+    delay(500);
+    Serial.print("."); 
+  }  
+  
+  //rtc.setAlarm1(0, 0 ,0 ,20 ,DS3231_MATCH_S);
+  //rtc.armAlarm1(true);
+  //attachInterrupt(digitalPinToInterrupt(ALARM_PIN), wake, FALLING);
+
+  Serial.println("Conectado");
+  server2.begin();
+  setBrightness();
+  setPowerEndpoint();
+}
+
+int counter = 0;
+void loop() {
+
+   
+
+   Serial.println(rtc.getDateTime().dayOfWeek);
+
+    delay(1000);
+  
+}
+
+
+
+
+
+
+//backup do dia 20/04/2020
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Wire.h> 
+#include <ESPAsyncWebServer.h>
+#include <AsyncJson.h>
+#include <ArduinoJson.h>
+#include <DS3232RTC.h>
+#include <RtcDS3231.h> //https://github.com/Makuna/Rtc.git
+#include "esp_task_wdt.h"
+#include <ESPmDNS.h>
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
+#include <string.h>
+
+const char* ssid = "Eduardo-2.4";
+const char* password = "@Edu143804-24";
+
+AsyncWebServer server(80);
+// Set your Static IP address
+IPAddress local_IP(192, 168, 15, 20);
+IPAddress gateway(192, 168, 15, 11);
+IPAddress subnet(255, 255, 0, 0);
+IPAddress primaryDNS(8, 8, 8, 8); // optional
+IPAddress secondaryDNS(8, 8, 4, 4); // optional
+String header;
+
+#define PINO_DIM    26
+#define PINO_ZC     27 
+#define ALARM_PIN     4
+#define maxBrightness 800
+#define minBrightness 7500
+#define INTERVAL_TRIGGER_TRIAC 20
+#define IDLE -1
+#define countof(a) (sizeof(a) / sizeof(a[0]))
+
+hw_timer_t * timerToPinHigh;
+hw_timer_t * timerToPinLow;
+
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+void tempTask(void *pvParameters);
+void clearWeekDays();
+void configWakeUpAlarm();
+void startWakeUpCountDown();
+int  getWakeUpDuration(byte minutes);
+void uploadFirmwwareRoutine();
+void printDateTime(const RtcDateTime& dt);
+void teste();
+
+TaskHandle_t tempTaskHandle = NULL;
+
+volatile bool isPinHighEnabled = false;
+volatile long currentBrightness = minBrightness; 
+byte counter = 0;
+int interval = minBrightness - maxBrightness;
+volatile int tempBrightness = minBrightness;
+byte alarmHour;
+byte alarmMinute;
+int weekDays[7];
+byte wakeUpDuration;
+volatile bool isAlarmEnabled = false;
+volatile bool shouldSetAlarm = false;
+
+DS3232RTC rtc(false);
+RtcDS3231<TwoWire> rtc2(Wire);
+
+void IRAM_ATTR ISR_turnPinLow(){
+  portENTER_CRITICAL_ISR(&mux); 
+    digitalWrite(PINO_DIM, LOW);
+    isPinHighEnabled = false;
+  portEXIT_CRITICAL_ISR(&mux); 
+}
+
+void IRAM_ATTR setTimerPinLow(){
+  timerToPinLow = timerBegin(1, 80, true);
+  timerAttachInterrupt(timerToPinLow, &ISR_turnPinLow, true);
+  timerAlarmWrite(timerToPinLow, INTERVAL_TRIGGER_TRIAC, false);
+  timerAlarmEnable(timerToPinLow);
+}
+
+void IRAM_ATTR ISR_turnPinHigh(){
+  portENTER_CRITICAL_ISR(&mux); 
+    digitalWrite(PINO_DIM, HIGH);  
+    setTimerPinLow(); 
+  portEXIT_CRITICAL_ISR(&mux); 
+}
+
+void IRAM_ATTR setTimerPinHigh(long brightness){
+  isPinHighEnabled = true; 
+  timerToPinHigh = timerBegin(1, 80, true);
+  timerAttachInterrupt(timerToPinHigh, &ISR_turnPinHigh, true);
+  timerAlarmWrite(timerToPinHigh, brightness, false);
+  timerAlarmEnable(timerToPinHigh);
+}
+
+void IRAM_ATTR ISR_zeroCross()  {
+  if(currentBrightness == IDLE) return;
+  portENTER_CRITICAL_ISR(&mux); 
+    if(!isPinHighEnabled){
+       setTimerPinHigh(currentBrightness);
+    }
+  portEXIT_CRITICAL_ISR(&mux); 
+}
+
+void start(){
+  currentBrightness = IDLE;
+  counter = 0;
+  pinMode(PINO_ZC,  INPUT_PULLUP);
+  pinMode(PINO_DIM, OUTPUT);
+  digitalWrite(PINO_DIM, LOW);
+}
+
+void turnLightOn(){
+  attachInterrupt(digitalPinToInterrupt(PINO_ZC), ISR_zeroCross, RISING);
+  portENTER_CRITICAL(&mux);
+    currentBrightness = maxBrightness;
+    digitalWrite(PINO_DIM, HIGH);
+  portEXIT_CRITICAL(&mux);
+}
+
+void turnLightOff(){
+  detachInterrupt(digitalPinToInterrupt(PINO_ZC));
+  portENTER_CRITICAL(&mux);
+    currentBrightness = IDLE;
+    digitalWrite(PINO_DIM, LOW);
+  portEXIT_CRITICAL(&mux);
+}
+
+void setPowerEndpoint(){
+  server.on("/power", HTTP_POST, [](AsyncWebServerRequest *request){},
+  [](AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final){},
+      [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+      {
+          StaticJsonDocument<200> jsonBuffer;
+          DeserializationError error = deserializeJson(jsonBuffer, data);
+          if (error) {
+            Serial.printf("Error ao deserializar");
+            Serial.println(error.c_str());
+            return;
+          }
+          const byte power = jsonBuffer["power"];
+          Serial.println("power");
+          if(power == 1){
+            turnLightOn();
+            delay(10);
+            request->send(200, "text/plain", "{\"response\": \"eu\"}");
+          }else{
+            turnLightOff();
+            delay(10);
+            request->send(201, "text/plain", "{\"response\": \"eu\"}");
+          }
+      });
+}
+
+void setBrightness(){
+  server.on("/brightness", HTTP_POST, [](AsyncWebServerRequest *request){},
+  [](AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final){},
+      [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+      {
+          StaticJsonDocument<200> jsonBuffer;
+          DeserializationError error = deserializeJson(jsonBuffer, data);
+          if (error) {
+            Serial.printf("Error ao deserializar");
+            Serial.println(error.c_str());
+            return;
+          }
+          int brightness = jsonBuffer["brightness"];
+          brightness = map(brightness, 100, 0, maxBrightness, minBrightness);
+          portENTER_CRITICAL(&mux);
+            currentBrightness = brightness;
+          portEXIT_CRITICAL(&mux);
+          Serial.println("brilho ");
+          Serial.print(currentBrightness);
+          delay(10);
+          request->send(200, "text/plain", "{\"response\": \"eu\"}");
+          
+      });
+}
+
+void setAlarm(){
+  server.on("/alarm", HTTP_POST, [](AsyncWebServerRequest *request){},
+  [](AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final){},
+      [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+      {
+          StaticJsonDocument<400> jsonBuffer;
+          DeserializationError error = deserializeJson(jsonBuffer, data);
+          if (error) {
+            Serial.printf("Error ao deserializar");
+            Serial.println(error.c_str());
+            return;
+          }
+          JsonArray days = jsonBuffer["days"];
+          clearWeekDays();
+          for(byte i = 0; i < days.size(); i++){
+            weekDays[i] = days[i];
+          }
+          wakeUpDuration = jsonBuffer["duration"]; 
+          isAlarmEnabled = jsonBuffer["enable"]; 
+          alarmHour      = jsonBuffer["startTime"]["hour"]; 
+          alarmMinute    = jsonBuffer["startTime"]["minute"];
+          shouldSetAlarm = true;
+
+          char output[128];
+          StaticJsonDocument<200> jsonResponse;
+          jsonResponse["response"].set("Alarme programado para ");
+          serializeJson(jsonResponse, output);
+          delay(10);
+          request->send(200, "text/plain", output);
+          
+      });
+}
+
+void clearWeekDays(){
+  memset(weekDays, 0, sizeof(weekDays));
+}
+
+void setup() {
+  Serial.begin(115200);
+  rtc.begin();
+  
+    // tmElements_t tm;
+    // tm.Hour = 20;               // set the RTC to an arbitrary time
+    // tm.Minute = 12;
+    // tm.Second = 00;
+    // tm.Day = 30;
+    // tm.Month = 3;
+    // tm.Year = 2020 - 1970;      // tmElements_t.Year is the offset from 1970
+    // rtc.write(tm);
+  xTaskCreatePinnedToCore(
+			tempTask,            /* Function to implement the task */
+			"temp ",             /* Name of the task */
+			10000,                /* Stack size in words */
+			NULL,                /* Task input parameter */
+			5,                   /* Priority of the task */
+			&tempTaskHandle,     /* Task handle. */
+			0); 
+  start();
+  
+  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
+    Serial.println("STA Failed to configure");
+  }
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid,password);
+  while(WiFi.waitForConnectResult() != WL_CONNECTED){
+    Serial.println("Connection Failed! Rebooting...");
+    delay(5000);
+    ESP.restart();
+  } 
+  //uploadFirmwwareRoutine(); 
+  server.begin();
+  setBrightness();
+  setPowerEndpoint();
+  setAlarm();
+  teste();
+}
+
+void teste(){
+  Serial.print("compiled: ");
+    Serial.print(__DATE__);
+    Serial.println(__TIME__);
+
+    //--------RTC SETUP ------------
+    // if you are using ESP-01 then uncomment the line below to reset the pins to
+    // the available pins for SDA, SCL
+    // Wire.begin(0, 2); // due to limited pins, use pin 0 and 2 for SDA, SCL
+    
+    rtc2.Begin();
+
+    RtcDateTime compiled = RtcDateTime(__DATE__, __TIME__);
+    printDateTime(compiled);
+    Serial.println();
+
+    if (!rtc2.IsDateTimeValid()) 
+    {
+        if (rtc2.LastError() != 0)
+        {
+            // we have a communications error
+            // see https://www.arduino.cc/en/Reference/WireEndTransmission for 
+            // what the number means
+            Serial.print("RTC communications error = ");
+            Serial.println(rtc2.LastError());
+        }
+        else
+        {
+            // Common Causes:
+            //    1) first time you ran and the device wasn't running yet
+            //    2) the battery on the device is low or even missing
+
+            Serial.println("RTC lost confidence in the DateTime!");
+
+            // following line sets the RTC to the date & time this sketch was compiled
+            // it will also reset the valid flag internally unless the Rtc device is
+            // having an issue
+
+            rtc2.SetDateTime(compiled);
+        }
+  }
+} 
+
+void printDateTime(const RtcDateTime& dt)
+{
+    char datestring[20];
+
+    snprintf_P(datestring, 
+            countof(datestring),
+            PSTR("%02u/%02u/%04u %02u:%02u:%02u"),
+            dt.Month(),
+            dt.Day(),
+            dt.Year(),
+            dt.Hour(),
+            dt.Minute(),
+            dt.Second() );
+    Serial.print(datestring);
+}
+
+void uploadFirmwwareRoutine(){
+  ArduinoOTA
+    .onStart([]() {
+      String type;
+      if (ArduinoOTA.getCommand() == U_FLASH)
+        type = "sketch";
+      else // U_SPIFFS
+        type = "filesystem";
+
+      // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
+      Serial.println("Start updating " + type);
+    })
+    .onEnd([]() {
+      Serial.println("\nEnd");
+    })
+    .onProgress([](unsigned int progress, unsigned int total) {
+      Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+    })
+    .onError([](ota_error_t error) {
+      Serial.printf("Error[%u]: ", error);
+      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+      else if (error == OTA_END_ERROR) Serial.println("End Failed");
+    });
+
+  ArduinoOTA.begin();
+}
+
+void configWakeUpAlarm(){
+  time_t time = rtc.get();
+  Serial.println("hora atual");
+  Serial.println("");
+  Serial.print("hora ");
+  Serial.print(hour(time));
+  Serial.print(" minuto ");
+  Serial.print(minute(time));
+  Serial.print(" dia ");
+  Serial.print(weekday(time));
+  Serial.println("-------------");
+  Serial.println("");
+  rtc.setAlarm(ALM2_MATCH_HOURS, 0, alarmMinute, alarmHour, 0); 
+}
+
+int matchWeekDays(){
+  int position = 0;
+  time_t t = rtc.get();
+  int currentDay = weekday(t);
+  while(weekDays[position] != 0){
+    if(weekDays[position] == currentDay){
+      return 1;
+    }
+    position++;
+  }
+  return 0;
+}
+
+void tempTask(void *pvParameters) {  
+  setSyncProvider(rtc.get);
+    for(;;){
+      if(shouldSetAlarm){
+        shouldSetAlarm = false;
+        configWakeUpAlarm();
+      }
+      if(rtc.alarm(ALARM_2) && matchWeekDays() == 1){
+        Serial.println("alarm disparado");
+        int timeDelay = getWakeUpDuration(alarmMinute);
+        attachInterrupt(digitalPinToInterrupt(PINO_ZC), ISR_zeroCross, RISING);
+        while(tempBrightness > maxBrightness){
+          esp_task_wdt_reset();
+          Serial.print(currentBrightness);
+          Serial.println(" disparando");
+          startWakeUpCountDown();
+          delay(timeDelay);
+        }
+      }
+      esp_task_wdt_reset();
+     }   	
+}
+
+int getWakeUpDuration(byte minutes){
+  return (minutes * 60000) / minBrightness;
+}
+
+void startWakeUpCountDown(){
+  if(counter < interval){
+    tempBrightness = tempBrightness - 1;
+    portENTER_CRITICAL(&mux);
+      currentBrightness = tempBrightness;
+    portEXIT_CRITICAL(&mux);
+  }
+  counter++;
+}
+
+void loop() {
+  RtcDateTime compiled = RtcDateTime(__DATE__, __TIME__);
+    printDateTime(rtc2.);
+    delay(1000);
+  //ArduinoOTA.handle();
+  // time_t time = now();
+  // Serial.print(hour(time));
+  // Serial.print("");
+  // delay(1000);
+}
